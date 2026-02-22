@@ -35,7 +35,6 @@ namespace AircraftWaypoints
         public string name = "New Route";
         public int mode; // RouteMode as int for JsonUtility
         public bool aglMode; // true = altitude is Above Ground Level (terrain-relative)
-        public bool autoRefuel; // true = RTB on low fuel, resume after refuel
         public bool rawFollow; // true = ignore terrain avoidance, follow path exactly
         public List<Waypoint> waypoints = new List<Waypoint>();
 
@@ -107,7 +106,7 @@ namespace AircraftWaypoints
         public int currentWaypointIndex;
         public bool pingPongReverse;
         public bool active = true;
-        public bool refueling; // true = currently RTB for fuel, AI controls flight
+
     }
 
     // ========== WAYPOINT MANAGER ==========
@@ -723,9 +722,6 @@ namespace AircraftWaypoints
         private static FieldInfo f_aircraft;
         private static FieldInfo f_destination;
         private static FieldInfo f_controlInputs;
-        private static FieldInfo f_fuelCapacity;
-        private static FieldInfo f_fuelLevel;
-        private static FieldInfo f_needsFuel;
         private static bool reflectionReady;
 
         static void CacheReflection()
@@ -735,9 +731,6 @@ namespace AircraftWaypoints
             f_aircraft = typeof(PilotBaseState).GetField("aircraft", flags);
             f_destination = typeof(PilotBaseState).GetField("destination", flags);
             f_controlInputs = typeof(PilotBaseState).GetField("controlInputs", flags);
-            f_fuelCapacity = typeof(Aircraft).GetField("fuelCapacity", flags);
-            f_fuelLevel = typeof(Aircraft).GetField("fuelLevel", flags);
-            f_needsFuel = typeof(Aircraft).GetField("needsFuel", flags);
             reflectionReady = f_aircraft != null && f_destination != null && f_controlInputs != null;
         }
 
@@ -750,35 +743,6 @@ namespace AircraftWaypoints
 
                 Aircraft aircraft = (Aircraft)f_aircraft.GetValue(__instance);
                 if (aircraft == null) return true;
-
-                // Auto-refuel: check fuel state before waypoint control
-                int id = aircraft.GetInstanceID();
-                if (WaypointManager.trackedAircraft.TryGetValue(id, out var wpState) && wpState.route != null && wpState.route.autoRefuel)
-                {
-                    float fuelCap = f_fuelCapacity != null ? (float)f_fuelCapacity.GetValue(aircraft) : 0f;
-                    float fuelLvl = f_fuelLevel != null ? (float)f_fuelLevel.GetValue(aircraft) : fuelCap;
-                    bool needs = f_needsFuel != null && (bool)f_needsFuel.GetValue(aircraft);
-                    float fuelRatio = fuelCap > 0 ? fuelLvl / fuelCap : 1f;
-
-                    if (wpState.refueling)
-                    {
-                        if (fuelRatio > 0.9f)
-                        {
-                            wpState.refueling = false;
-                            Plugin.Log?.LogInfo($"Refuel complete, resuming waypoints for {aircraft.name}");
-                        }
-                        else
-                        {
-                            return true; // Let original AI fly to base
-                        }
-                    }
-                    else if (fuelRatio < 0.25f && needs)
-                    {
-                        wpState.refueling = true;
-                        Plugin.Log?.LogInfo($"Low fuel ({fuelRatio:P0}), RTB for refuel: {aircraft.name}");
-                        return true;
-                    }
-                }
 
                 if (!WaypointManager.TryGetWaypointDestination(aircraft, out GlobalPosition destination, out float targetHeight, out float throttle, out bool aglMode, out bool rawFollow))
                     return true;
@@ -1555,9 +1519,10 @@ namespace AircraftWaypoints
             // Route options
             GUILayout.BeginHorizontal();
             currentRoute.aglMode = GUILayout.Toggle(currentRoute.aglMode, " AGL", GUILayout.Width(55));
-            currentRoute.autoRefuel = GUILayout.Toggle(currentRoute.autoRefuel, " Auto Refuel", GUILayout.Width(100));
             currentRoute.rawFollow = GUILayout.Toggle(currentRoute.rawFollow, " Raw", GUILayout.Width(55));
             GUILayout.EndHorizontal();
+            var hintStyle = new GUIStyle(GUI.skin.label) { fontSize = 10, normal = { textColor = new Color(0.6f, 0.6f, 0.6f) } };
+            GUILayout.Label("AGL: altitude above ground | Raw: follow path exactly, ignore terrain avoidance", hintStyle);
 
             GUILayout.Space(4);
 
