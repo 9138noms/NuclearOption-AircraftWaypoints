@@ -64,11 +64,39 @@ namespace AircraftWaypoints
         public float offsetForward;
     }
 
+    // ========== CAMERA DATA ==========
+
+    [Serializable]
+    public class CameraWaypoint
+    {
+        public float x, y, z;       // global position
+        public float rx, ry, rz;    // euler rotation
+        public float fov;           // 0 = keep current
+    }
+
+    [Serializable]
+    public class CameraRoute
+    {
+        public string name = "Camera Route";
+        public int mode; // RouteMode as int
+        public float speed = 50f; // m/s along path
+        public bool lookAtTarget; // always face followed unit
+        public bool autoSpeed; // match speed to followed unit
+        public List<CameraWaypoint> waypoints = new List<CameraWaypoint>();
+
+        public RouteMode Mode
+        {
+            get => (RouteMode)mode;
+            set => mode = (int)value;
+        }
+    }
+
     [Serializable]
     public class MissionWaypointData
     {
         public List<WaypointRoute> routes = new List<WaypointRoute>();
         public List<AircraftAssignment> assignments = new List<AircraftAssignment>();
+        public List<CameraRoute> cameraRoutes = new List<CameraRoute>();
     }
 
     public class AircraftWaypointState
@@ -410,7 +438,283 @@ namespace AircraftWaypoints
         }
     }
 
+    // ========== CAMERA PLAYBACK ==========
+
+    public static class CameraPlayback
+    {
+        public static List<CameraRoute> cameraRouteLibrary = new List<CameraRoute>();
+        public static int selectedCameraRouteIndex = -1;
+
+        public static CameraRoute activeRoute;
+        public static bool playing;
+        public static bool paused;
+        public static int currentSegment;
+        public static float segmentT;
+        public static float playbackSpeed = 1f;
+        public static bool pingPongReverse;
+
+        // Frame-calculated values (applied in LateUpdate postfix)
+        public static Vector3 framePosition;
+        public static Quaternion frameRotation;
+        public static float frameFOV;
+        public static bool frameReady;
+
+        // Cached LookAt target (set at playback start)
+        public static Unit cachedLookAtUnit;
+
+        /// <summary>Get the next waypoint index, handling Loop wrap-around.</summary>
+        private static int GetNextIdx(int seg, int count, RouteMode mode)
+        {
+            if (pingPongReverse)
+                return seg - 1;
+            if (mode == RouteMode.Loop)
+                return (seg + 1) % count; // wrap: last → first
+            return seg + 1;
+        }
+
+        public static void StartPlayback(CameraRoute route)
+        {
+            if (route == null || route.waypoints.Count < 2) return;
+            activeRoute = route;
+            currentSegment = 0;
+            segmentT = 0;
+            playing = true;
+            paused = false;
+            pingPongReverse = false;
+            frameReady = false;
+
+            // Cache LookAt target
+            cachedLookAtUnit = null;
+            if (route.lookAtTarget || route.autoSpeed)
+            {
+                var csm = UnityEngine.Object.FindObjectOfType<CameraStateManager>();
+                if (csm != null && csm.followingUnit != null)
+                    cachedLookAtUnit = csm.followingUnit;
+            }
+
+            Plugin.Log?.LogInfo($"Camera playback started: {route.name} ({route.waypoints.Count} pts, {route.speed} m/s)" +
+                (cachedLookAtUnit != null ? $" target={cachedLookAtUnit.name}" : ""));
+        }
+
+        public static void StopPlayback()
+        {
+            playing = false;
+            paused = false;
+            activeRoute = null;
+            frameReady = false;
+            cachedLookAtUnit = null;
+            Plugin.Log?.LogInfo("Camera playback stopped");
+        }
+
+        public static void TogglePause()
+        {
+            if (!playing) return;
+            paused = !paused;
+        }
+
+        /// <summary>Called in Update() — advances time and calculates target position/rotation.</summary>
+        public static void UpdatePlayback()
+        {
+            if (!playing || paused || activeRoute == null) { frameReady = false; return; }
+
+            var wps = activeRoute.waypoints;
+            int count = wps.Count;
+            if (count < 2) { StopPlayback(); return; }
+
+            // Get current segment endpoints
+            int nextIdx = GetNextIdx(currentSegment, count, activeRoute.Mode);
+            if (nextIdx < 0 || nextIdx >= count) { StopPlayback(); return; }
+            var wpA = wps[currentSegment];
+            var wpB = wps[nextIdx];
+
+            Vector3 posA = new GlobalPosition(wpA.x, wpA.y, wpA.z).ToLocalPosition();
+            Vector3 posB = new GlobalPosition(wpB.x, wpB.y, wpB.z).ToLocalPosition();
+            float segmentLength = Vector3.Distance(posA, posB);
+
+            // Determine speed: autoSpeed matches unit speed, otherwise use route speed
+            float speed = activeRoute.speed * playbackSpeed;
+            if (activeRoute.autoSpeed && cachedLookAtUnit != null)
+            {
+                // Use unit's current speed
+                float unitSpeed = cachedLookAtUnit.speed;
+                if (unitSpeed > 1f)
+                    speed = unitSpeed * playbackSpeed;
+            }
+
+            // Advance based on speed
+            if (segmentLength > 0.1f)
+                segmentT += (speed * Time.deltaTime) / segmentLength;
+            else
+                segmentT = 1f;
+
+            // Advance segments
+            while (segmentT >= 1f && playing)
+            {
+                segmentT -= 1f;
+                if (!AdvanceSegment()) { frameReady = false; return; }
+
+                nextIdx = GetNextIdx(currentSegment, count, activeRoute.Mode);
+                if (nextIdx < 0 || nextIdx >= count) { StopPlayback(); frameReady = false; return; }
+                wpA = wps[currentSegment];
+                wpB = wps[nextIdx];
+                posA = new GlobalPosition(wpA.x, wpA.y, wpA.z).ToLocalPosition();
+                posB = new GlobalPosition(wpB.x, wpB.y, wpB.z).ToLocalPosition();
+                segmentLength = Vector3.Distance(posA, posB);
+            }
+
+            if (!playing) { frameReady = false; return; }
+
+            // Interpolate position
+            float t = Mathf.Clamp01(segmentT);
+            Vector3 pos = Vector3.Lerp(posA, posB, t);
+
+            // Catmull-Rom smoothing for position (if 4+ waypoints available)
+            if (count >= 4)
+            {
+                int i0, i1, i2, i3;
+                if (pingPongReverse)
+                {
+                    i1 = currentSegment;
+                    i2 = Mathf.Max(currentSegment - 1, 0);
+                    i0 = Mathf.Min(currentSegment + 1, count - 1);
+                    i3 = Mathf.Max(currentSegment - 2, 0);
+                }
+                else if (activeRoute.Mode == RouteMode.Loop)
+                {
+                    i1 = currentSegment;
+                    i2 = (currentSegment + 1) % count;
+                    i0 = (currentSegment - 1 + count) % count;
+                    i3 = (currentSegment + 2) % count;
+                }
+                else
+                {
+                    i1 = currentSegment;
+                    i2 = Mathf.Min(currentSegment + 1, count - 1);
+                    i0 = Mathf.Max(currentSegment - 1, 0);
+                    i3 = Mathf.Min(currentSegment + 2, count - 1);
+                }
+                Vector3 p0 = new GlobalPosition(wps[i0].x, wps[i0].y, wps[i0].z).ToLocalPosition();
+                Vector3 p1 = new GlobalPosition(wps[i1].x, wps[i1].y, wps[i1].z).ToLocalPosition();
+                Vector3 p2 = new GlobalPosition(wps[i2].x, wps[i2].y, wps[i2].z).ToLocalPosition();
+                Vector3 p3 = new GlobalPosition(wps[i3].x, wps[i3].y, wps[i3].z).ToLocalPosition();
+                pos = CatmullRom(p0, p1, p2, p3, t);
+            }
+
+            // Interpolate rotation
+            Quaternion rotA = Quaternion.Euler(wpA.rx, wpA.ry, wpA.rz);
+            Quaternion rotB = Quaternion.Euler(wpB.rx, wpB.ry, wpB.rz);
+            Quaternion rot = Quaternion.Slerp(rotA, rotB, t);
+
+            // Interpolate FOV
+            float fovA = wpA.fov > 0 ? wpA.fov : 60f;
+            float fovB = wpB.fov > 0 ? wpB.fov : 60f;
+            float fov = Mathf.Lerp(fovA, fovB, t);
+
+            // LookAt override: face the cached target unit
+            if (activeRoute.lookAtTarget && cachedLookAtUnit != null && !cachedLookAtUnit.disabled)
+            {
+                Vector3 targetPos = cachedLookAtUnit.transform.position;
+                Vector3 dir = targetPos - pos;
+                if (dir.sqrMagnitude > 1f)
+                    rot = Quaternion.LookRotation(dir);
+            }
+
+            // Store for LateUpdate application
+            framePosition = pos;
+            frameRotation = rot;
+            frameFOV = fov;
+            frameReady = true;
+        }
+
+        /// <summary>Called via Harmony postfix on CameraStateManager.LateUpdate — applies camera AFTER game camera update.</summary>
+        public static void ApplyCameraOverride()
+        {
+            if (!playing || !frameReady) return;
+
+            var cam = Camera.main;
+            if (cam == null) return;
+
+            cam.transform.position = framePosition;
+            cam.transform.rotation = frameRotation;
+            cam.fieldOfView = frameFOV;
+        }
+
+        private static bool AdvanceSegment()
+        {
+            int count = activeRoute.waypoints.Count;
+            switch (activeRoute.Mode)
+            {
+                case RouteMode.Loop:
+                    // Loop has N segments (including last→first), so advance mod N
+                    currentSegment = (currentSegment + 1) % count;
+                    return true;
+                case RouteMode.OneShot:
+                    currentSegment++;
+                    if (currentSegment >= count - 1) { StopPlayback(); return false; }
+                    return true;
+                case RouteMode.PingPong:
+                    if (!pingPongReverse)
+                    {
+                        currentSegment++;
+                        if (currentSegment >= count - 1) { pingPongReverse = true; }
+                    }
+                    else
+                    {
+                        currentSegment--;
+                        if (currentSegment <= 0) { pingPongReverse = false; }
+                    }
+                    return true;
+            }
+            return true;
+        }
+
+        private static Vector3 CatmullRom(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t)
+        {
+            float t2 = t * t;
+            float t3 = t2 * t;
+            return 0.5f * (
+                (2f * p1) +
+                (-p0 + p2) * t +
+                (2f * p0 - 5f * p1 + 4f * p2 - p3) * t2 +
+                (-p0 + 3f * p1 - 3f * p2 + p3) * t3
+            );
+        }
+
+        public static float GetProgress()
+        {
+            if (activeRoute == null || activeRoute.waypoints.Count < 2) return 0;
+            int totalSegments = activeRoute.Mode == RouteMode.Loop
+                ? activeRoute.waypoints.Count  // Loop: N segments (including wrap)
+                : activeRoute.waypoints.Count - 1;
+            return (currentSegment + segmentT) / totalSegments;
+        }
+
+        public static void ClearAll()
+        {
+            StopPlayback();
+            cameraRouteLibrary.Clear();
+            selectedCameraRouteIndex = -1;
+        }
+    }
+
     // ========== HARMONY PATCHES ==========
+
+    // Patch 0: Apply camera override AFTER game camera update
+    [HarmonyPatch(typeof(CameraStateManager), "LateUpdate")]
+    public static class Patch_CameraLateUpdate
+    {
+        static void Postfix()
+        {
+            try
+            {
+                CameraPlayback.ApplyCameraOverride();
+            }
+            catch (Exception e)
+            {
+                Plugin.Log?.LogError($"CameraLateUpdate patch error: {e.Message}");
+            }
+        }
+    }
 
     // Patch 1: Hijack AI flight when waypoints are assigned
     [HarmonyPatch(typeof(AIPilotCombatModes), "FixedUpdateState")]
@@ -599,6 +903,7 @@ namespace AircraftWaypoints
         {
             var data = new MissionWaypointData();
             data.routes = new List<WaypointRoute>(WaypointManager.routeLibrary);
+            data.cameraRoutes = new List<CameraRoute>(CameraPlayback.cameraRouteLibrary);
 
             foreach (var kv in WaypointManager.assignmentsByName)
             {
@@ -636,6 +941,8 @@ namespace AircraftWaypoints
                 var data = JsonUtility.FromJson<MissionWaypointData>(json);
 
                 WaypointManager.routeLibrary = data.routes ?? new List<WaypointRoute>();
+                CameraPlayback.cameraRouteLibrary = data.cameraRoutes ?? new List<CameraRoute>();
+                CameraPlayback.selectedCameraRouteIndex = CameraPlayback.cameraRouteLibrary.Count > 0 ? 0 : -1;
                 WaypointManager.assignmentsByName.Clear();
                 WaypointManager.formationOffsets.Clear();
 
@@ -700,15 +1007,47 @@ namespace AircraftWaypoints
         private string offsetUpText = "0";
         private string offsetForwardText = "0";
 
-        // Camera recording
+        // Camera recording (aircraft waypoints)
         private bool recording;
         private float recordTimer;
         private float recordInterval = 0.5f;
         private string recordIntervalText = "0.5";
 
+        // Camera route recording
+        private bool camRecording;
+        private float camRecordTimer;
+        private float camRecordInterval = 0.2f;
+        private string camRecordIntervalText = "0.2";
+        private Vector2 camRouteScroll;
+        private Vector2 camWaypointScroll;
+        private Vector2 camTargetScroll;
+        private string camSpeedText = "50";
+        private string camPlaybackSpeedText = "1";
+        private bool showTargetPicker;
+
         private GUIStyle boxStyle, labelStyle, buttonStyle, headerStyle, activeButtonStyle;
         private GUIStyle smallButtonStyle, textFieldStyle, wpLabelStyle, infoStyle;
         private Texture2D bgTex, activeBtnTex;
+
+        // Route color palette
+        private static readonly Color[] routeColors = new Color[]
+        {
+            new Color(1f, 0.8f, 0.2f, 0.8f),   // Yellow
+            new Color(0.3f, 0.9f, 1f, 0.8f),    // Cyan
+            new Color(0.4f, 1f, 0.4f, 0.8f),    // Green
+            new Color(1f, 0.5f, 0.9f, 0.8f),    // Pink
+            new Color(1f, 0.6f, 0.2f, 0.8f),    // Orange
+            new Color(0.6f, 0.6f, 1f, 0.8f),    // Lavender
+        };
+        private static readonly Color[] camRouteColors = new Color[]
+        {
+            new Color(1f, 0.3f, 0.3f, 0.8f),    // Red
+            new Color(0.3f, 0.5f, 1f, 0.8f),    // Blue
+            new Color(0.8f, 0.3f, 1f, 0.8f),    // Purple
+            new Color(1f, 0.9f, 0.3f, 0.8f),    // Gold
+            new Color(0.3f, 1f, 0.8f, 0.8f),    // Teal
+            new Color(1f, 0.5f, 0.5f, 0.8f),    // Salmon
+        };
 
         private bool IsEditor => GameManager.gameState == GameState.Editor;
 
@@ -765,6 +1104,7 @@ namespace AircraftWaypoints
             KeyCode key = Plugin.Instance != null ? Plugin.Instance.toggleKey.Value : KeyCode.F5;
             if (Input.GetKeyDown(key))
                 showUI = !showUI;
+
 
             if (placingWaypoint && Input.GetMouseButtonDown(0))
             {
@@ -823,6 +1163,31 @@ namespace AircraftWaypoints
                 }
             }
 
+            // Camera route recording: position + rotation + FOV
+            if (camRecording)
+            {
+                camRecordTimer += Time.unscaledDeltaTime;
+                if (camRecordTimer >= camRecordInterval)
+                {
+                    camRecordTimer -= camRecordInterval;
+                    var cam = Camera.main;
+                    if (cam != null && CameraPlayback.selectedCameraRouteIndex >= 0 &&
+                        CameraPlayback.selectedCameraRouteIndex < CameraPlayback.cameraRouteLibrary.Count)
+                    {
+                        var route = CameraPlayback.cameraRouteLibrary[CameraPlayback.selectedCameraRouteIndex];
+                        Vector3 pos = cam.transform.position;
+                        Vector3 euler = cam.transform.eulerAngles;
+                        GlobalPosition gp = pos.ToGlobalPosition();
+                        route.waypoints.Add(new CameraWaypoint
+                        {
+                            x = gp.x, y = gp.y, z = gp.z,
+                            rx = euler.x, ry = euler.y, rz = euler.z,
+                            fov = cam.fieldOfView
+                        });
+                    }
+                }
+            }
+
             if (!IsEditor)
             {
                 cleanupTimer += Time.deltaTime;
@@ -858,7 +1223,8 @@ namespace AircraftWaypoints
             if (!showUI) return;
             InitStyles();
             windowRect = GUI.Window(59812, windowRect, DrawWindow, "", boxStyle);
-            DrawWaypointMarkers();
+            DrawAllRouteMarkers();
+            DrawAllCameraRouteMarkers();
             DrawAircraftMarkers();
 
             if (placingWaypoint)
@@ -913,13 +1279,14 @@ namespace AircraftWaypoints
 
         private void DrawWindow(int windowID)
         {
-            GUILayout.Label("Aircraft Waypoints v1.0.0", headerStyle);
+            GUILayout.Label("Aircraft Waypoints v2.0.0", headerStyle);
             GUILayout.Label(IsEditor ? "[Mission Editor Mode]" : "[Gameplay Mode]", infoStyle);
             GUILayout.Space(2);
 
             GUILayout.BeginHorizontal();
             if (GUILayout.Button("Aircraft", uiTab == 0 ? activeButtonStyle : buttonStyle)) uiTab = 0;
             if (GUILayout.Button("Routes", uiTab == 1 ? activeButtonStyle : buttonStyle)) uiTab = 1;
+            if (GUILayout.Button("Camera", uiTab == 3 ? activeButtonStyle : buttonStyle)) uiTab = 3;
             if (GUILayout.Button("Save/Load", uiTab == 2 ? activeButtonStyle : buttonStyle)) uiTab = 2;
             GUILayout.EndHorizontal();
             GUILayout.Space(4);
@@ -929,6 +1296,7 @@ namespace AircraftWaypoints
                 case 0: DrawAircraftTab(); break;
                 case 1: DrawRouteEditorTab(); break;
                 case 2: DrawFileTab(); break;
+                case 3: DrawCameraTab(); break;
             }
 
             GUI.DragWindow();
@@ -1359,156 +1727,545 @@ namespace AircraftWaypoints
             }
         }
 
+        // ---- Tab 3: Camera ----
+        private void DrawCameraTab()
+        {
+            GUILayout.Label("Camera Routes", headerStyle);
+
+            // Camera route list
+            camRouteScroll = GUILayout.BeginScrollView(camRouteScroll, GUILayout.Height(70));
+            for (int i = 0; i < CameraPlayback.cameraRouteLibrary.Count; i++)
+            {
+                var r = CameraPlayback.cameraRouteLibrary[i];
+                bool isSel = i == CameraPlayback.selectedCameraRouteIndex;
+                GUILayout.BeginHorizontal();
+                if (GUILayout.Button(isSel ? $"> {r.name} ({r.waypoints.Count})" : $"  {r.name} ({r.waypoints.Count})",
+                    isSel ? activeButtonStyle : buttonStyle))
+                {
+                    CameraPlayback.selectedCameraRouteIndex = i;
+                    camSpeedText = r.speed.ToString("F0");
+                }
+                if (GUILayout.Button("X", smallButtonStyle, GUILayout.Width(25)))
+                {
+                    if (CameraPlayback.activeRoute == r) CameraPlayback.StopPlayback();
+                    CameraPlayback.cameraRouteLibrary.RemoveAt(i);
+                    if (CameraPlayback.selectedCameraRouteIndex >= CameraPlayback.cameraRouteLibrary.Count)
+                        CameraPlayback.selectedCameraRouteIndex = CameraPlayback.cameraRouteLibrary.Count - 1;
+                    break;
+                }
+                GUILayout.EndHorizontal();
+            }
+            GUILayout.EndScrollView();
+
+            if (GUILayout.Button("+ New Camera Route", buttonStyle))
+            {
+                var route = new CameraRoute { name = "Cam " + (CameraPlayback.cameraRouteLibrary.Count + 1) };
+                CameraPlayback.cameraRouteLibrary.Add(route);
+                CameraPlayback.selectedCameraRouteIndex = CameraPlayback.cameraRouteLibrary.Count - 1;
+            }
+
+            GUILayout.Space(4);
+
+            if (CameraPlayback.selectedCameraRouteIndex < 0 ||
+                CameraPlayback.selectedCameraRouteIndex >= CameraPlayback.cameraRouteLibrary.Count)
+            {
+                GUILayout.Label("Select or create a camera route", wpLabelStyle);
+                return;
+            }
+
+            var currentRoute = CameraPlayback.cameraRouteLibrary[CameraPlayback.selectedCameraRouteIndex];
+
+            // Route settings
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Name:", labelStyle, GUILayout.Width(40));
+            string newName = GUILayout.TextField(currentRoute.name, textFieldStyle);
+            if (newName != currentRoute.name) currentRoute.name = newName;
+            GUILayout.EndHorizontal();
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Mode:", labelStyle, GUILayout.Width(40));
+            if (GUILayout.Button("Loop", currentRoute.Mode == RouteMode.Loop ? activeButtonStyle : buttonStyle))
+                currentRoute.Mode = RouteMode.Loop;
+            if (GUILayout.Button("One", currentRoute.Mode == RouteMode.OneShot ? activeButtonStyle : buttonStyle))
+                currentRoute.Mode = RouteMode.OneShot;
+            if (GUILayout.Button("PgPg", currentRoute.Mode == RouteMode.PingPong ? activeButtonStyle : buttonStyle))
+                currentRoute.Mode = RouteMode.PingPong;
+            GUILayout.EndHorizontal();
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Speed:", labelStyle, GUILayout.Width(40));
+            camSpeedText = GUILayout.TextField(camSpeedText, textFieldStyle, GUILayout.Width(50));
+            float.TryParse(camSpeedText, out float spd);
+            if (spd < 1f) spd = 1f;
+            currentRoute.speed = spd;
+            GUILayout.Label("m/s", wpLabelStyle, GUILayout.Width(30));
+            GUILayout.EndHorizontal();
+
+            GUILayout.BeginHorizontal();
+            currentRoute.lookAtTarget = GUILayout.Toggle(currentRoute.lookAtTarget, " LookAt", GUILayout.Width(70));
+            currentRoute.autoSpeed = GUILayout.Toggle(currentRoute.autoSpeed, " AutoSpd", GUILayout.Width(75));
+            GUILayout.EndHorizontal();
+
+            // Target unit selector
+            if (currentRoute.lookAtTarget || currentRoute.autoSpeed)
+            {
+                GUILayout.BeginHorizontal();
+                string targetName = CameraPlayback.cachedLookAtUnit != null
+                    ? (CameraPlayback.cachedLookAtUnit.definition != null
+                        ? CameraPlayback.cachedLookAtUnit.definition.name
+                        : CameraPlayback.cachedLookAtUnit.name)
+                    : "None";
+                GUILayout.Label($"Target: {targetName}", wpLabelStyle);
+                if (GUILayout.Button(showTargetPicker ? "Close" : "Select", smallButtonStyle, GUILayout.Width(50)))
+                    showTargetPicker = !showTargetPicker;
+                GUILayout.EndHorizontal();
+
+                if (showTargetPicker)
+                {
+                    camTargetScroll = GUILayout.BeginScrollView(camTargetScroll, GUILayout.Height(100));
+                    var allUnits = UnityEngine.Object.FindObjectsOfType<Unit>();
+
+                    // Build display list with identifiers
+                    var unitList = new List<(Unit unit, string display)>();
+                    var typeCount = new Dictionary<string, int>();
+                    foreach (var unit in allUnits)
+                    {
+                        if (unit == null || unit.disabled) continue;
+                        string typeName = unit.definition != null ? unit.definition.name : "Unit";
+
+                        // Get unique identifier
+                        string uid = "";
+                        if (unit.SavedUnit != null && !string.IsNullOrEmpty(unit.SavedUnit.UniqueName))
+                            uid = unit.SavedUnit.UniqueName;
+                        else if (unit is Aircraft ac && !string.IsNullOrEmpty(ac.UniqueName))
+                            uid = ac.UniqueName;
+
+                        // Auto-assign index if no unique name
+                        if (string.IsNullOrEmpty(uid))
+                        {
+                            if (!typeCount.ContainsKey(typeName)) typeCount[typeName] = 0;
+                            typeCount[typeName]++;
+                            uid = $"#{typeCount[typeName]}";
+                        }
+
+                        unitList.Add((unit, $"{typeName} ({uid})"));
+                    }
+
+                    // Sort: aircraft first, then by name
+                    unitList.Sort((a, b) =>
+                    {
+                        bool aIsAc = a.unit is Aircraft;
+                        bool bIsAc = b.unit is Aircraft;
+                        if (aIsAc != bIsAc) return aIsAc ? -1 : 1;
+                        return string.Compare(a.display, b.display, StringComparison.Ordinal);
+                    });
+
+                    foreach (var (unit, display) in unitList)
+                    {
+                        bool isCurrent = CameraPlayback.cachedLookAtUnit == unit;
+                        if (GUILayout.Button(isCurrent ? $"> {display}" : $"  {display}",
+                            isCurrent ? activeButtonStyle : buttonStyle))
+                        {
+                            CameraPlayback.cachedLookAtUnit = unit;
+                            showTargetPicker = false;
+                        }
+                    }
+                    GUILayout.EndScrollView();
+                }
+            }
+
+            GUILayout.Space(2);
+
+            // Camera waypoints list
+            GUILayout.Label($"Camera Points ({currentRoute.waypoints.Count})", labelStyle);
+            camWaypointScroll = GUILayout.BeginScrollView(camWaypointScroll, GUILayout.Height(80));
+            for (int i = 0; i < currentRoute.waypoints.Count; i++)
+            {
+                var cwp = currentRoute.waypoints[i];
+                GUILayout.BeginHorizontal();
+                GUILayout.Label($"#{i + 1}", wpLabelStyle, GUILayout.Width(25));
+
+                string distStr = "";
+                if (i < currentRoute.waypoints.Count - 1)
+                {
+                    var next = currentRoute.waypoints[i + 1];
+                    float d = Vector3.Distance(
+                        new GlobalPosition(cwp.x, cwp.y, cwp.z).ToLocalPosition(),
+                        new GlobalPosition(next.x, next.y, next.z).ToLocalPosition());
+                    distStr = d >= 1000 ? $" {d / 1000f:F1}km" : $" {d:F0}m";
+                }
+
+                GUILayout.Label($"fov:{cwp.fov:F0}{distStr}", wpLabelStyle, GUILayout.Width(180));
+                if (GUILayout.Button("^", smallButtonStyle, GUILayout.Width(22)) && i > 0)
+                {
+                    currentRoute.waypoints.RemoveAt(i);
+                    currentRoute.waypoints.Insert(i - 1, cwp);
+                }
+                if (GUILayout.Button("X", smallButtonStyle, GUILayout.Width(22)))
+                {
+                    currentRoute.waypoints.RemoveAt(i);
+                    break;
+                }
+                GUILayout.EndHorizontal();
+            }
+            GUILayout.EndScrollView();
+
+            GUILayout.Space(2);
+
+            // Add camera waypoint
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button("Add At Camera", buttonStyle))
+            {
+                var cam = Camera.main;
+                if (cam != null)
+                {
+                    Vector3 pos = cam.transform.position;
+                    Vector3 euler = cam.transform.eulerAngles;
+                    GlobalPosition gp = pos.ToGlobalPosition();
+                    currentRoute.waypoints.Add(new CameraWaypoint
+                    {
+                        x = gp.x, y = gp.y, z = gp.z,
+                        rx = euler.x, ry = euler.y, rz = euler.z,
+                        fov = cam.fieldOfView
+                    });
+                }
+            }
+            if (GUILayout.Button("Clear", smallButtonStyle, GUILayout.Width(50)))
+                currentRoute.waypoints.Clear();
+            GUILayout.EndHorizontal();
+
+            // Camera recording
+            GUILayout.BeginHorizontal();
+            string camRecLabel = camRecording ? ">> REC <<" : "Record Path";
+            if (GUILayout.Button(camRecLabel, camRecording ? activeButtonStyle : buttonStyle))
+            {
+                if (camRecording)
+                {
+                    camRecording = false;
+                    Plugin.Log?.LogInfo($"Camera recording stopped. {currentRoute.waypoints.Count} points.");
+                }
+                else
+                {
+                    camRecording = true;
+                    camRecordTimer = 0f;
+                }
+            }
+            GUILayout.Label("Int:", wpLabelStyle, GUILayout.Width(25));
+            camRecordIntervalText = GUILayout.TextField(camRecordIntervalText, textFieldStyle, GUILayout.Width(35));
+            float.TryParse(camRecordIntervalText, out camRecordInterval);
+            if (camRecordInterval < 0.05f) camRecordInterval = 0.05f;
+            GUILayout.Label("s", wpLabelStyle, GUILayout.Width(12));
+            GUILayout.EndHorizontal();
+
+            GUILayout.Space(6);
+
+            // ---- Playback Controls ----
+            GUILayout.Label("Playback", headerStyle);
+
+            // Progress bar
+            if (CameraPlayback.playing)
+            {
+                float progress = CameraPlayback.GetProgress();
+                Rect progRect = GUILayoutUtility.GetRect(0, 12, GUILayout.ExpandWidth(true));
+                GUI.color = new Color(0.2f, 0.2f, 0.2f, 1f);
+                GUI.DrawTexture(progRect, Texture2D.whiteTexture);
+                GUI.color = new Color(0.3f, 0.8f, 0.4f, 1f);
+                GUI.DrawTexture(new Rect(progRect.x, progRect.y, progRect.width * progress, progRect.height), Texture2D.whiteTexture);
+                GUI.color = Color.white;
+                GUI.Label(progRect, $" {progress:P0} seg {CameraPlayback.currentSegment + 1}/{currentRoute.waypoints.Count}", wpLabelStyle);
+            }
+
+            GUILayout.BeginHorizontal();
+            bool isPlaying = CameraPlayback.playing && CameraPlayback.activeRoute == currentRoute;
+            if (!isPlaying)
+            {
+                if (GUILayout.Button("Play", buttonStyle))
+                    CameraPlayback.StartPlayback(currentRoute);
+            }
+            else
+            {
+                if (GUILayout.Button(CameraPlayback.paused ? "Resume" : "Pause", buttonStyle))
+                    CameraPlayback.TogglePause();
+                if (GUILayout.Button("Stop", buttonStyle))
+                    CameraPlayback.StopPlayback();
+            }
+            GUILayout.EndHorizontal();
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Speed:", wpLabelStyle, GUILayout.Width(40));
+            camPlaybackSpeedText = GUILayout.TextField(camPlaybackSpeedText, textFieldStyle, GUILayout.Width(40));
+            float.TryParse(camPlaybackSpeedText, out float pbSpeed);
+            if (pbSpeed < 0.1f) pbSpeed = 0.1f;
+            CameraPlayback.playbackSpeed = pbSpeed;
+            GUILayout.Label("x", wpLabelStyle, GUILayout.Width(12));
+            if (GUILayout.Button("0.5x", smallButtonStyle)) { CameraPlayback.playbackSpeed = 0.5f; camPlaybackSpeedText = "0.5"; }
+            if (GUILayout.Button("1x", smallButtonStyle)) { CameraPlayback.playbackSpeed = 1f; camPlaybackSpeedText = "1"; }
+            if (GUILayout.Button("2x", smallButtonStyle)) { CameraPlayback.playbackSpeed = 2f; camPlaybackSpeedText = "2"; }
+            GUILayout.EndHorizontal();
+        }
+
         // ---- Markers ----
         private Texture2D lineTex;
 
-        private void DrawWaypointMarkers()
+        private Color GetRouteColor(int index, bool selected)
         {
-            if (WaypointManager.selectedRouteIndex < 0 || WaypointManager.selectedRouteIndex >= WaypointManager.routeLibrary.Count)
-                return;
+            Color c = routeColors[index % routeColors.Length];
+            if (!selected) c.a *= 0.4f; // dim non-selected
+            return c;
+        }
 
-            var route = WaypointManager.routeLibrary[WaypointManager.selectedRouteIndex];
-            var cam = Camera.main;
-            if (cam == null || route.waypoints.Count == 0) return;
+        private Color GetCamRouteColor(int index, bool selected)
+        {
+            Color c = camRouteColors[index % camRouteColors.Length];
+            if (!selected) c.a *= 0.4f;
+            return c;
+        }
 
+        private void EnsureLineTex()
+        {
             if (lineTex == null)
             {
                 lineTex = new Texture2D(1, 1);
                 lineTex.SetPixel(0, 0, Color.white);
                 lineTex.Apply();
             }
+        }
 
-            // Collect screen positions (AGL mode: convert stored AGL altitude to absolute)
-            var screenPoints = new List<(Vector3 screen, bool visible, int index)>();
-            for (int i = 0; i < route.waypoints.Count; i++)
+        // Draw ALL aircraft routes with per-route colors
+        private void DrawAllRouteMarkers()
+        {
+            var cam = Camera.main;
+            if (cam == null) return;
+            EnsureLineTex();
+
+            int bottomLabelY = 0; // stack bottom labels
+
+            for (int ri = 0; ri < WaypointManager.routeLibrary.Count; ri++)
             {
-                Vector3 localPos = route.waypoints[i].ToGlobalPosition().ToLocalPosition();
-                if (route.aglMode)
+                var route = WaypointManager.routeLibrary[ri];
+                if (route.waypoints.Count == 0) continue;
+
+                bool isSelected = ri == WaypointManager.selectedRouteIndex;
+                Color baseColor = GetRouteColor(ri, isSelected);
+                float lineWidth = isSelected ? 2.5f : 1.5f;
+                float boxSize = isSelected ? 7 : 5;
+
+                // Collect screen positions
+                var screenPoints = new List<(Vector3 screen, bool visible)>();
+                for (int i = 0; i < route.waypoints.Count; i++)
                 {
-                    float groundH = WaypointManager.GetGroundHeight(localPos);
-                    localPos.y = groundH + route.waypoints[i].y;
+                    Vector3 localPos = route.waypoints[i].ToGlobalPosition().ToLocalPosition();
+                    if (route.aglMode)
+                    {
+                        float groundH = WaypointManager.GetGroundHeight(localPos);
+                        localPos.y = groundH + route.waypoints[i].y;
+                    }
+                    Vector3 sp = cam.WorldToScreenPoint(localPos);
+                    screenPoints.Add((sp, sp.z > 0));
                 }
-                Vector3 sp = cam.WorldToScreenPoint(localPos);
-                screenPoints.Add((sp, sp.z > 0, i));
-            }
 
-            // Draw lines between consecutive waypoints
-            for (int i = 0; i < screenPoints.Count - 1; i++)
-            {
-                var a = screenPoints[i];
-                var b = screenPoints[i + 1];
-                if (a.visible && b.visible)
+                // Lines between waypoints
+                for (int i = 0; i < screenPoints.Count - 1; i++)
                 {
-                    float ay = Screen.height - a.screen.y;
-                    float by = Screen.height - b.screen.y;
+                    var a = screenPoints[i];
+                    var b = screenPoints[i + 1];
+                    if (a.visible && b.visible)
+                    {
+                        float ay = Screen.height - a.screen.y;
+                        float by = Screen.height - b.screen.y;
+                        GUI.color = baseColor;
+                        DrawLine(new Vector2(a.screen.x, ay), new Vector2(b.screen.x, by), lineWidth);
 
-                    // Line
-                    GUI.color = new Color(1f, 0.8f, 0.2f, 0.6f);
-                    DrawLine(new Vector2(a.screen.x, ay), new Vector2(b.screen.x, by), 2f);
+                        // Distance label (selected only, to avoid clutter)
+                        if (isSelected)
+                        {
+                            float dist = FastMath.Distance(route.waypoints[i].ToGlobalPosition(), route.waypoints[i + 1].ToGlobalPosition());
+                            float mx = (a.screen.x + b.screen.x) / 2f;
+                            float my = (ay + by) / 2f;
+                            string distLabel = dist >= 1000 ? $"{dist / 1000f:F1}km" : $"{dist:F0}m";
+                            GUI.color = new Color(0, 0, 0, 0.7f);
+                            GUI.Label(new Rect(mx - 9, my - 9, 60, 18), distLabel);
+                            GUI.color = baseColor;
+                            GUI.Label(new Rect(mx - 10, my - 10, 60, 18), distLabel);
+                        }
+                    }
+                }
 
-                    // Distance label at midpoint
-                    float dist = FastMath.Distance(
-                        route.waypoints[i].ToGlobalPosition(),
-                        route.waypoints[i + 1].ToGlobalPosition());
-                    float mx = (a.screen.x + b.screen.x) / 2f;
-                    float my = (ay + by) / 2f;
-                    string distLabel = dist >= 1000 ? $"{dist / 1000f:F1}km" : $"{dist:F0}m";
+                // Loop line
+                if (route.Mode == RouteMode.Loop && screenPoints.Count > 1)
+                {
+                    var a = screenPoints[screenPoints.Count - 1];
+                    var b = screenPoints[0];
+                    if (a.visible && b.visible)
+                    {
+                        Color loopColor = baseColor; loopColor.a *= 0.5f;
+                        GUI.color = loopColor;
+                        DrawLine(new Vector2(a.screen.x, Screen.height - a.screen.y),
+                                 new Vector2(b.screen.x, Screen.height - b.screen.y), 1f);
+                    }
+                }
 
+                // Waypoint markers
+                for (int i = 0; i < screenPoints.Count; i++)
+                {
+                    if (!screenPoints[i].visible) continue;
+                    float sx = screenPoints[i].screen.x;
+                    float sy = Screen.height - screenPoints[i].screen.y;
+
+                    // Selected route: full detail (altitude lines, labels)
+                    if (isSelected)
+                    {
+                        var wp = route.waypoints[i];
+                        Vector3 wpLocal = wp.ToGlobalPosition().ToLocalPosition();
+                        Vector3 groundLocal;
+                        string altText;
+                        if (route.aglMode)
+                        {
+                            float groundH = WaypointManager.GetGroundHeight(wpLocal);
+                            groundLocal = new Vector3(wpLocal.x, groundH, wpLocal.z);
+                            altText = $"AGL {wp.y:F0}m";
+                        }
+                        else
+                        {
+                            groundLocal = new GlobalPosition(wp.x, 0, wp.z).ToLocalPosition();
+                            altText = $"{wp.y:F0}m";
+                        }
+                        Vector3 gs = cam.WorldToScreenPoint(groundLocal);
+                        if (gs.z > 0)
+                        {
+                            float gsy = Screen.height - gs.y;
+                            Color altColor = baseColor; altColor.a *= 0.4f;
+                            GUI.color = altColor;
+                            DrawLine(new Vector2(sx, sy), new Vector2(gs.x, gsy), 1f);
+                            float midY = (sy + gsy) / 2f;
+                            GUI.color = new Color(0, 0, 0, 0.6f);
+                            GUI.Label(new Rect(sx + 6, midY - 7, 80, 16), altText);
+                            GUI.color = baseColor;
+                            GUI.Label(new Rect(sx + 5, midY - 8, 80, 16), altText);
+                        }
+                    }
+
+                    // WP label
+                    string label = isSelected ? $"WP{i + 1}" : $"{route.name[0]}{i + 1}";
+                    GUI.color = new Color(0, 0, 0, 0.8f);
+                    GUI.Label(new Rect(sx - 14, sy - 21, 80, 20), label);
+                    GUI.color = baseColor;
+                    GUI.Label(new Rect(sx - 15, sy - 22, 80, 20), label);
+
+                    // Box
+                    GUI.DrawTexture(new Rect(sx - boxSize / 2, sy - boxSize / 2, boxSize, boxSize), Texture2D.whiteTexture);
+                }
+
+                // Route name + total distance at bottom
+                if (route.waypoints.Count > 1)
+                {
+                    float totalDist = 0;
+                    for (int i = 0; i < route.waypoints.Count - 1; i++)
+                        totalDist += FastMath.Distance(route.waypoints[i].ToGlobalPosition(), route.waypoints[i + 1].ToGlobalPosition());
+                    if (route.Mode == RouteMode.Loop)
+                        totalDist += FastMath.Distance(route.waypoints[route.waypoints.Count - 1].ToGlobalPosition(), route.waypoints[0].ToGlobalPosition());
+
+                    string totalLabel = totalDist >= 1000 ? $"{route.name}: {totalDist / 1000f:F1}km" : $"{route.name}: {totalDist:F0}m";
+                    float ly = Screen.height - 40 - bottomLabelY * 16;
                     GUI.color = new Color(0, 0, 0, 0.7f);
-                    GUI.Label(new Rect(mx - 9, my - 9, 60, 18), distLabel);
-                    GUI.color = new Color(1f, 0.9f, 0.5f, 0.9f);
-                    GUI.Label(new Rect(mx - 10, my - 10, 60, 18), distLabel);
+                    GUI.Label(new Rect(11, ly + 1, 250, 20), totalLabel);
+                    GUI.color = baseColor;
+                    GUI.Label(new Rect(10, ly, 250, 20), totalLabel);
+                    bottomLabelY++;
                 }
             }
+            GUI.color = Color.white;
+        }
 
-            // Loop line: last → first (if Loop mode)
-            if (route.Mode == RouteMode.Loop && screenPoints.Count > 1)
+        // Draw ALL camera routes with per-route colors + direction indicators
+        private void DrawAllCameraRouteMarkers()
+        {
+            var cam = Camera.main;
+            if (cam == null) return;
+            EnsureLineTex();
+
+            for (int ri = 0; ri < CameraPlayback.cameraRouteLibrary.Count; ri++)
             {
-                var a = screenPoints[screenPoints.Count - 1];
-                var b = screenPoints[0];
-                if (a.visible && b.visible)
+                var route = CameraPlayback.cameraRouteLibrary[ri];
+                if (route.waypoints.Count == 0) continue;
+
+                bool isSelected = ri == CameraPlayback.selectedCameraRouteIndex;
+                Color baseColor = GetCamRouteColor(ri, isSelected);
+                float lineWidth = isSelected ? 2.5f : 1.5f;
+
+                // Collect screen positions
+                var screenPoints = new List<(Vector3 screen, bool visible, Vector3 localPos)>();
+                for (int i = 0; i < route.waypoints.Count; i++)
                 {
-                    float ay = Screen.height - a.screen.y;
-                    float by = Screen.height - b.screen.y;
-                    GUI.color = new Color(0.2f, 1f, 0.4f, 0.4f);
-                    DrawLine(new Vector2(a.screen.x, ay), new Vector2(b.screen.x, by), 1f);
+                    var cwp = route.waypoints[i];
+                    Vector3 localPos = new GlobalPosition(cwp.x, cwp.y, cwp.z).ToLocalPosition();
+                    Vector3 sp = cam.WorldToScreenPoint(localPos);
+                    screenPoints.Add((sp, sp.z > 0, localPos));
+                }
+
+                // Lines between waypoints
+                for (int i = 0; i < screenPoints.Count - 1; i++)
+                {
+                    var a = screenPoints[i];
+                    var b = screenPoints[i + 1];
+                    if (a.visible && b.visible)
+                    {
+                        float ay = Screen.height - a.screen.y;
+                        float by = Screen.height - b.screen.y;
+                        GUI.color = baseColor;
+                        DrawLine(new Vector2(a.screen.x, ay), new Vector2(b.screen.x, by), lineWidth);
+                    }
+                }
+
+                // Loop line
+                if (route.Mode == RouteMode.Loop && screenPoints.Count > 1)
+                {
+                    var a = screenPoints[screenPoints.Count - 1];
+                    var b = screenPoints[0];
+                    if (a.visible && b.visible)
+                    {
+                        Color loopColor = baseColor; loopColor.a *= 0.5f;
+                        GUI.color = loopColor;
+                        DrawLine(new Vector2(a.screen.x, Screen.height - a.screen.y),
+                                 new Vector2(b.screen.x, Screen.height - b.screen.y), 1f);
+                    }
+                }
+
+                // Camera waypoint markers + direction arrow
+                for (int i = 0; i < screenPoints.Count; i++)
+                {
+                    if (!screenPoints[i].visible) continue;
+                    var cwp = route.waypoints[i];
+                    float sx = screenPoints[i].screen.x;
+                    float sy = Screen.height - screenPoints[i].screen.y;
+
+                    // Camera icon: triangle (shows direction)
+                    GUI.color = baseColor;
+                    float triSize = isSelected ? 8 : 5;
+                    GUI.DrawTexture(new Rect(sx - triSize / 2, sy - triSize / 2, triSize, triSize), Texture2D.whiteTexture);
+
+                    // Direction line: short line showing where camera is pointing
+                    if (isSelected)
+                    {
+                        Vector3 fwd = Quaternion.Euler(cwp.rx, cwp.ry, cwp.rz) * Vector3.forward;
+                        Vector3 dirEnd = screenPoints[i].localPos + fwd * 30f;
+                        Vector3 dirScreen = cam.WorldToScreenPoint(dirEnd);
+                        if (dirScreen.z > 0)
+                        {
+                            Color dirColor = baseColor; dirColor.a *= 0.6f;
+                            GUI.color = dirColor;
+                            DrawLine(new Vector2(sx, sy), new Vector2(dirScreen.x, Screen.height - dirScreen.y), 1f);
+                        }
+
+                        // Label
+                        string label = $"C{i + 1}";
+                        GUI.color = new Color(0, 0, 0, 0.8f);
+                        GUI.Label(new Rect(sx - 12, sy - 21, 80, 20), label);
+                        GUI.color = baseColor;
+                        GUI.Label(new Rect(sx - 13, sy - 22, 80, 20), label);
+                    }
                 }
             }
-
-            // Draw altitude lines + waypoint markers
-            for (int i = 0; i < screenPoints.Count; i++)
-            {
-                if (!screenPoints[i].visible) continue;
-
-                var wp = route.waypoints[i];
-                float sx = screenPoints[i].screen.x;
-                float sy = Screen.height - screenPoints[i].screen.y;
-
-                // Altitude line: ground → waypoint
-                // AGL mode: ground = actual terrain below WP; Non-AGL: ground = sea level (y=0)
-                Vector3 wpLocal = wp.ToGlobalPosition().ToLocalPosition();
-                Vector3 groundLocal;
-                string altText;
-                if (route.aglMode)
-                {
-                    float groundH = WaypointManager.GetGroundHeight(wpLocal);
-                    groundLocal = new Vector3(wpLocal.x, groundH, wpLocal.z);
-                    altText = $"AGL {wp.y:F0}m";
-                }
-                else
-                {
-                    GlobalPosition groundGP = new GlobalPosition(wp.x, 0, wp.z);
-                    groundLocal = groundGP.ToLocalPosition();
-                    altText = $"{wp.y:F0}m";
-                }
-                Vector3 groundScreen = cam.WorldToScreenPoint(groundLocal);
-                if (groundScreen.z > 0)
-                {
-                    float gsy = Screen.height - groundScreen.y;
-                    // Vertical line
-                    GUI.color = new Color(1f, 0.7f, 0.3f, 0.35f);
-                    DrawLine(new Vector2(sx, sy), new Vector2(groundScreen.x, gsy), 1f);
-
-                    // Ground dot
-                    GUI.color = new Color(1f, 0.5f, 0.2f, 0.5f);
-                    GUI.DrawTexture(new Rect(groundScreen.x - 2, gsy - 2, 4, 4), Texture2D.whiteTexture);
-
-                    // Altitude label on the line
-                    float midY = (sy + gsy) / 2f;
-                    GUI.color = new Color(0, 0, 0, 0.6f);
-                    GUI.Label(new Rect(sx + 6, midY - 7, 80, 16), altText);
-                    GUI.color = new Color(1f, 0.8f, 0.4f, 0.9f);
-                    GUI.Label(new Rect(sx + 5, midY - 8, 80, 16), altText);
-                }
-
-                // WP label
-                string label = $"WP{i + 1}";
-                GUI.color = new Color(0, 0, 0, 0.8f);
-                GUI.Label(new Rect(sx - 14, sy - 21, 80, 20), label);
-                GUI.color = Color.yellow;
-                GUI.Label(new Rect(sx - 15, sy - 22, 80, 20), label);
-
-                // Box
-                float boxSize = 7;
-                GUI.DrawTexture(new Rect(sx - boxSize / 2, sy - boxSize / 2, boxSize, boxSize), Texture2D.whiteTexture);
-            }
-
-            // Total route distance
-            if (route.waypoints.Count > 1)
-            {
-                float totalDist = 0;
-                for (int i = 0; i < route.waypoints.Count - 1; i++)
-                    totalDist += FastMath.Distance(route.waypoints[i].ToGlobalPosition(), route.waypoints[i + 1].ToGlobalPosition());
-                if (route.Mode == RouteMode.Loop)
-                    totalDist += FastMath.Distance(route.waypoints[route.waypoints.Count - 1].ToGlobalPosition(), route.waypoints[0].ToGlobalPosition());
-
-                string totalLabel = totalDist >= 1000 ? $"Total: {totalDist / 1000f:F1}km" : $"Total: {totalDist:F0}m";
-                GUI.color = new Color(0, 0, 0, 0.7f);
-                GUI.Label(new Rect(11, Screen.height - 39, 200, 20), totalLabel);
-                GUI.color = new Color(0.6f, 0.9f, 1f);
-                GUI.Label(new Rect(10, Screen.height - 40, 200, 20), totalLabel);
-            }
-
             GUI.color = Color.white;
         }
 
@@ -1602,6 +2359,7 @@ namespace AircraftWaypoints
         private void Update()
         {
             Plugin.Instance?.waypointUI?.HandleInput();
+            CameraPlayback.UpdatePlayback();
         }
 
         private void OnGUI()
@@ -1612,7 +2370,7 @@ namespace AircraftWaypoints
 
     // ========== PLUGIN ==========
 
-    [BepInPlugin("com.noms.aircraftwaypoints", "Aircraft Waypoints", "1.0.0")]
+    [BepInPlugin("com.noms.aircraftwaypoints", "Aircraft Waypoints", "2.0.0")]
     public class Plugin : BaseUnityPlugin
     {
         internal static ManualLogSource Log;
@@ -1621,6 +2379,7 @@ namespace AircraftWaypoints
 
         internal WaypointUI waypointUI;
         internal ConfigEntry<KeyCode> toggleKey;
+
         internal ConfigEntry<float> arrivalRadius;
         internal ConfigEntry<float> turnSmoothness;
 
@@ -1630,6 +2389,7 @@ namespace AircraftWaypoints
             Instance = this;
 
             toggleKey = Config.Bind("Controls", "ToggleKey", KeyCode.F5, "Key to toggle waypoint UI");
+
             arrivalRadius = Config.Bind("Flight", "ArrivalRadius", 500f, "Distance (m) to waypoint before advancing to next");
             turnSmoothness = Config.Bind("Flight", "TurnSmoothness", 0.5f, "AutoAim effort (0.2=smooth cinematic, 1.0=aggressive)");
 
@@ -1652,7 +2412,7 @@ namespace AircraftWaypoints
             }
 
             SceneManager.sceneLoaded += OnSceneLoaded;
-            Log.LogInfo("Aircraft Waypoints v1.0.0 loaded — F5 to toggle UI");
+            Log.LogInfo("Aircraft Waypoints v2.0.0 loaded — F5 to toggle UI (Camera system added)");
         }
 
         private void OnSceneLoaded(UnityEngine.SceneManagement.Scene scene, LoadSceneMode mode)
