@@ -846,6 +846,265 @@ namespace AircraftWaypoints
         }
     }
 
+    // ========== SIMPLE JSON (replaces broken JsonUtility) ==========
+
+    public static class SimpleJson
+    {
+        public static string Serialize(MissionWaypointData data)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("{");
+
+            // Routes
+            sb.AppendLine("  \"routes\": [");
+            for (int i = 0; i < data.routes.Count; i++)
+            {
+                var r = data.routes[i];
+                sb.AppendLine("    {");
+                sb.AppendLine($"      \"name\": {Esc(r.name)},");
+                sb.AppendLine($"      \"mode\": {r.mode},");
+                sb.AppendLine($"      \"aglMode\": {B(r.aglMode)},");
+                sb.AppendLine($"      \"rawFollow\": {B(r.rawFollow)},");
+                sb.AppendLine("      \"waypoints\": [");
+                for (int j = 0; j < r.waypoints.Count; j++)
+                {
+                    var w = r.waypoints[j];
+                    sb.Append($"        {{\"x\":{F(w.x)},\"y\":{F(w.y)},\"z\":{F(w.z)},\"speed\":{F(w.speed)}}}");
+                    sb.AppendLine(j < r.waypoints.Count - 1 ? "," : "");
+                }
+                sb.AppendLine("      ]");
+                sb.Append("    }");
+                sb.AppendLine(i < data.routes.Count - 1 ? "," : "");
+            }
+            sb.AppendLine("  ],");
+
+            // Assignments
+            sb.AppendLine("  \"assignments\": [");
+            for (int i = 0; i < data.assignments.Count; i++)
+            {
+                var a = data.assignments[i];
+                sb.Append($"    {{\"uniqueName\":{Esc(a.uniqueName)},\"routeIndex\":{a.routeIndex},\"offsetRight\":{F(a.offsetRight)},\"offsetUp\":{F(a.offsetUp)},\"offsetForward\":{F(a.offsetForward)}}}");
+                sb.AppendLine(i < data.assignments.Count - 1 ? "," : "");
+            }
+            sb.AppendLine("  ],");
+
+            // Camera routes
+            sb.AppendLine("  \"cameraRoutes\": [");
+            for (int i = 0; i < data.cameraRoutes.Count; i++)
+            {
+                var cr = data.cameraRoutes[i];
+                sb.AppendLine("    {");
+                sb.AppendLine($"      \"name\": {Esc(cr.name)},");
+                sb.AppendLine($"      \"mode\": {cr.mode},");
+                sb.AppendLine($"      \"speed\": {F(cr.speed)},");
+                sb.AppendLine($"      \"lookAtTarget\": {B(cr.lookAtTarget)},");
+                sb.AppendLine($"      \"autoSpeed\": {B(cr.autoSpeed)},");
+                sb.AppendLine("      \"waypoints\": [");
+                for (int j = 0; j < cr.waypoints.Count; j++)
+                {
+                    var cw = cr.waypoints[j];
+                    sb.Append($"        {{\"x\":{F(cw.x)},\"y\":{F(cw.y)},\"z\":{F(cw.z)},\"rx\":{F(cw.rx)},\"ry\":{F(cw.ry)},\"rz\":{F(cw.rz)},\"fov\":{F(cw.fov)}}}");
+                    sb.AppendLine(j < cr.waypoints.Count - 1 ? "," : "");
+                }
+                sb.AppendLine("      ]");
+                sb.Append("    }");
+                sb.AppendLine(i < data.cameraRoutes.Count - 1 ? "," : "");
+            }
+            sb.AppendLine("  ]");
+
+            sb.AppendLine("}");
+            return sb.ToString();
+        }
+
+        public static MissionWaypointData Deserialize(string json)
+        {
+            var data = new MissionWaypointData();
+            try
+            {
+                // Use Unity's built-in JSON parser for reading (works for deserialization)
+                var parsed = (Dictionary<string, object>)MiniJsonParser.Parse(json);
+
+                if (parsed.ContainsKey("routes"))
+                {
+                    foreach (Dictionary<string, object> r in (List<object>)parsed["routes"])
+                    {
+                        var route = new WaypointRoute();
+                        route.name = Str(r, "name", "Route");
+                        route.mode = Int(r, "mode");
+                        route.aglMode = Bool(r, "aglMode");
+                        route.rawFollow = Bool(r, "rawFollow");
+                        if (r.ContainsKey("waypoints"))
+                        {
+                            foreach (Dictionary<string, object> w in (List<object>)r["waypoints"])
+                            {
+                                route.waypoints.Add(new Waypoint
+                                {
+                                    x = Flt(w, "x"), y = Flt(w, "y"), z = Flt(w, "z"),
+                                    speed = Flt(w, "speed")
+                                });
+                            }
+                        }
+                        data.routes.Add(route);
+                    }
+                }
+
+                if (parsed.ContainsKey("assignments"))
+                {
+                    foreach (Dictionary<string, object> a in (List<object>)parsed["assignments"])
+                    {
+                        data.assignments.Add(new AircraftAssignment
+                        {
+                            uniqueName = Str(a, "uniqueName", ""),
+                            routeIndex = Int(a, "routeIndex"),
+                            offsetRight = Flt(a, "offsetRight"),
+                            offsetUp = Flt(a, "offsetUp"),
+                            offsetForward = Flt(a, "offsetForward")
+                        });
+                    }
+                }
+
+                if (parsed.ContainsKey("cameraRoutes"))
+                {
+                    foreach (Dictionary<string, object> cr in (List<object>)parsed["cameraRoutes"])
+                    {
+                        var camRoute = new CameraRoute();
+                        camRoute.name = Str(cr, "name", "Camera Route");
+                        camRoute.mode = Int(cr, "mode");
+                        camRoute.speed = Flt(cr, "speed", 50f);
+                        camRoute.lookAtTarget = Bool(cr, "lookAtTarget");
+                        camRoute.autoSpeed = Bool(cr, "autoSpeed");
+                        if (cr.ContainsKey("waypoints"))
+                        {
+                            foreach (Dictionary<string, object> cw in (List<object>)cr["waypoints"])
+                            {
+                                camRoute.waypoints.Add(new CameraWaypoint
+                                {
+                                    x = Flt(cw, "x"), y = Flt(cw, "y"), z = Flt(cw, "z"),
+                                    rx = Flt(cw, "rx"), ry = Flt(cw, "ry"), rz = Flt(cw, "rz"),
+                                    fov = Flt(cw, "fov", 60f)
+                                });
+                            }
+                        }
+                        data.cameraRoutes.Add(camRoute);
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Plugin.Log?.LogError($"JSON parse error: {e.Message}");
+            }
+            return data;
+        }
+
+        private static string Esc(string s) => "\"" + (s ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+        private static string F(float v) => v.ToString("G9", System.Globalization.CultureInfo.InvariantCulture);
+        private static string B(bool v) => v ? "true" : "false";
+        private static string Str(Dictionary<string, object> d, string k, string def = "") => d.ContainsKey(k) ? d[k]?.ToString() ?? def : def;
+        private static int Int(Dictionary<string, object> d, string k) => d.ContainsKey(k) ? (int)(double)d[k] : 0;
+        private static float Flt(Dictionary<string, object> d, string k, float def = 0f) => d.ContainsKey(k) ? (float)(double)d[k] : def;
+        private static bool Bool(Dictionary<string, object> d, string k) => d.ContainsKey(k) && d[k] is bool b && b;
+    }
+
+    // ========== MINI JSON PARSER ==========
+
+    public static class MiniJsonParser
+    {
+        private static int idx;
+        private static string src;
+
+        public static object Parse(string json)
+        {
+            src = json;
+            idx = 0;
+            return ParseValue();
+        }
+
+        private static void SkipWhitespace() { while (idx < src.Length && " \t\n\r".IndexOf(src[idx]) >= 0) idx++; }
+
+        private static object ParseValue()
+        {
+            SkipWhitespace();
+            if (idx >= src.Length) return null;
+            char c = src[idx];
+            if (c == '{') return ParseObject();
+            if (c == '[') return ParseArray();
+            if (c == '"') return ParseString();
+            if (c == 't') { idx += 4; return true; }
+            if (c == 'f') { idx += 5; return false; }
+            if (c == 'n') { idx += 4; return null; }
+            return ParseNumber();
+        }
+
+        private static Dictionary<string, object> ParseObject()
+        {
+            var dict = new Dictionary<string, object>();
+            idx++; // skip {
+            SkipWhitespace();
+            if (idx < src.Length && src[idx] == '}') { idx++; return dict; }
+            while (idx < src.Length)
+            {
+                SkipWhitespace();
+                string key = ParseString();
+                SkipWhitespace();
+                idx++; // skip :
+                dict[key] = ParseValue();
+                SkipWhitespace();
+                if (idx < src.Length && src[idx] == ',') { idx++; continue; }
+                break;
+            }
+            if (idx < src.Length && src[idx] == '}') idx++;
+            return dict;
+        }
+
+        private static List<object> ParseArray()
+        {
+            var list = new List<object>();
+            idx++; // skip [
+            SkipWhitespace();
+            if (idx < src.Length && src[idx] == ']') { idx++; return list; }
+            while (idx < src.Length)
+            {
+                list.Add(ParseValue());
+                SkipWhitespace();
+                if (idx < src.Length && src[idx] == ',') { idx++; continue; }
+                break;
+            }
+            if (idx < src.Length && src[idx] == ']') idx++;
+            return list;
+        }
+
+        private static string ParseString()
+        {
+            idx++; // skip opening "
+            var sb = new System.Text.StringBuilder();
+            while (idx < src.Length)
+            {
+                char c = src[idx++];
+                if (c == '"') return sb.ToString();
+                if (c == '\\' && idx < src.Length)
+                {
+                    char next = src[idx++];
+                    if (next == '"') sb.Append('"');
+                    else if (next == '\\') sb.Append('\\');
+                    else if (next == 'n') sb.Append('\n');
+                    else if (next == 't') sb.Append('\t');
+                    else sb.Append(next);
+                }
+                else sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        private static double ParseNumber()
+        {
+            int start = idx;
+            while (idx < src.Length && "-0123456789.eE+".IndexOf(src[idx]) >= 0) idx++;
+            double.TryParse(src.Substring(start, idx - start), System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out double val);
+            return val;
+        }
+    }
+
     // ========== FILE IO ==========
 
     public static class WaypointFileIO
@@ -888,9 +1147,9 @@ namespace AircraftWaypoints
             string safeName = string.Join("_", missionName.Split(Path.GetInvalidFileNameChars()));
             if (string.IsNullOrEmpty(safeName)) safeName = "mission";
             string path = Path.Combine(dataFolder, safeName + ".json");
-            string json = JsonUtility.ToJson(data, true);
+            string json = SimpleJson.Serialize(data);
             File.WriteAllText(path, json);
-            Plugin.Log?.LogInfo($"Waypoint data saved: {path}");
+            Plugin.Log?.LogInfo($"Waypoint data saved: {path} ({data.routes.Count} routes, {data.assignments.Count} assignments)");
         }
 
         public static bool LoadMissionData(string missionName)
@@ -902,7 +1161,7 @@ namespace AircraftWaypoints
             try
             {
                 string json = File.ReadAllText(path);
-                var data = JsonUtility.FromJson<MissionWaypointData>(json);
+                var data = SimpleJson.Deserialize(json);
 
                 WaypointManager.routeLibrary = data.routes ?? new List<WaypointRoute>();
                 CameraPlayback.cameraRouteLibrary = data.cameraRoutes ?? new List<CameraRoute>();
@@ -928,6 +1187,21 @@ namespace AircraftWaypoints
                 }
 
                 Plugin.Log?.LogInfo($"Waypoint data loaded: {path} ({data.routes.Count} routes, {data.assignments.Count} assignments)");
+
+                // Re-link already-spawned aircraft to loaded assignments
+                var allAircraft = UnityEngine.Object.FindObjectsOfType<Aircraft>();
+                foreach (var ac in allAircraft)
+                {
+                    if (ac == null || ac.disabled) continue;
+                    string uname = "";
+                    if (ac.SavedUnit != null)
+                        uname = ac.SavedUnit.UniqueName ?? "";
+                    else if (!string.IsNullOrEmpty(ac.UniqueName))
+                        uname = ac.UniqueName;
+                    if (!string.IsNullOrEmpty(uname))
+                        WaypointManager.OnAircraftSpawned(ac, uname);
+                }
+
                 return true;
             }
             catch (Exception e)
@@ -2335,7 +2609,7 @@ namespace AircraftWaypoints
 
     // ========== PLUGIN ==========
 
-    [BepInPlugin("com.noms.aircraftwaypoints", "Aircraft Waypoints", "2.0.0")]
+    [BepInPlugin("com.noms.aircraftwaypoints", "Aircraft Waypoints", "2.1.0")]
     public class Plugin : BaseUnityPlugin
     {
         internal static ManualLogSource Log;
